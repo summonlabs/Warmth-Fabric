@@ -38,15 +38,19 @@ bool Coordinator::start() { return listener_.listen(cfg_.host, cfg_.port); }
 void Coordinator::stop() {
     if (stopping_.exchange(true)) return;
     listener_.close();
-    // Close every live worker connection so the per-connection threads unblock.
+    // Close every live connection - registered workers and peers that have not
+    // (or could not) register - so every per-connection thread unblocks, and take
+    // the thread list under the lock: the accept loop adds to it concurrently
+    // and, once stopping_ is set, adds nothing more.
+    std::vector<std::thread> threads;
     {
         std::lock_guard<std::mutex> g(mutex_);
-        std::vector<net::TcpConnection*> conns;
-        for (auto& kv : workers_) conns.push_back(&kv.second->conn);
-        for (auto* c : conns) if (c && c->valid()) c->close();
+        for (auto& w : conns_) {
+            if (auto c = w.lock()) { if (c->conn.valid()) c->conn.close(); }
+        }
+        threads.swap(threads_);
     }
-    for (auto& t : threads_) if (t.joinable()) t.join();
-    threads_.clear();
+    for (auto& t : threads) if (t.joinable()) t.join();
 }
 
 std::uint16_t Coordinator::port() const noexcept { return listener_.port(); }
@@ -68,6 +72,9 @@ void Coordinator::handle_one_connection() {
 void Coordinator::on_connection(net::TcpConnection conn) {
     auto cs = std::make_shared<ConnState>();
     cs->conn = std::move(conn);
+    std::lock_guard<std::mutex> g(mutex_);
+    if (stopping_.load()) return;   // stop() has taken the thread list: drop the late connection
+    conns_.push_back(cs);
     threads_.emplace_back([this, cs] { process_connection(cs); });
     // Detach is not used; threads are joined in stop(). A thread that finishes
     // leaves a joinable entry that stop() will join.
@@ -106,6 +113,15 @@ void Coordinator::roll_epoch() {
     }
     if (!in_flight_.empty()) in_flight_count_.store(0);
     in_flight_.clear();
+    notify_settled();
+}
+
+// Wake wait_until_settled() after in_flight_count_ changed. Taking warm_mutex_
+// first means a waiter is either before its predicate check (and sees the new
+// count) or already waiting; notifying without it could be lost between the
+// waiter's check and its sleep, leaving it blocked forever.
+void Coordinator::notify_settled() {
+    { std::lock_guard<std::mutex> wl(warm_mutex_); }
     warm_cv_.notify_all();
 }
 
@@ -285,7 +301,7 @@ void Coordinator::handle_frame(std::shared_ptr<ConnState> cs, const proto::Frame
                     }
                 }
             }
-            if (notify) warm_cv_.notify_all();
+            if (notify) notify_settled();
             return;
         }
         case proto::MessageType::PING:
@@ -299,10 +315,27 @@ void Coordinator::handle_frame(std::shared_ptr<ConnState> cs, const proto::Frame
 }
 
 void Coordinator::on_disconnect(std::shared_ptr<ConnState> cs) {
+    bool settled = false;
+    {
     std::lock_guard<std::mutex> g(mutex_);
     if (!cs->registered) return;
     auto it = workers_.find(cs->id);
-    if (it != workers_.end() && it->second == cs) workers_.erase(it);
+    if (it != workers_.end() && it->second == cs) {
+        workers_.erase(it);
+        // Attempts dispatched to the departed worker can no longer complete:
+        // release their budget and fail them, so the budget balances and
+        // wait_until_settled() returns instead of waiting forever.
+        for (auto ait = in_flight_.begin(); ait != in_flight_.end();) {
+            if (ait->second.worker != cs->id) { ++ait; continue; }
+            budget_.release(ait->second.reservation_id);
+            if (ait->second.op_reservation_id) budget_.release(ait->second.op_reservation_id);
+            auto fit = objects_.find(ait->second.object);
+            if (fit != objects_.end()) fit->second.transition(WarmthState::FAILED, "worker_disconnect");
+            ait = in_flight_.erase(ait);
+            if (in_flight_count_.load() > 0) in_flight_count_.fetch_sub(1);
+            settled = true;
+        }
+    }
     auto oit = worker_objects_.find(cs->id);
     if (oit != worker_objects_.end()) {
         for (const auto& oid : oit->second) {
@@ -317,6 +350,8 @@ void Coordinator::on_disconnect(std::shared_ptr<ConnState> cs) {
             o.set_dimension(DimensionIndex::AllocatorReadiness, DimensionStatus::SUSPECT);
         }
     }
+    }
+    if (settled) notify_settled();
 }
 
 void Coordinator::invalidate_worker_objects_locked(const WorkerId& worker) {
@@ -377,7 +412,7 @@ bool Coordinator::issue_warm(const WarmthObjectId& object, WarmthAction action, 
             in_flight_.erase(it);
             if (in_flight_count_.load() > 0) in_flight_count_.fetch_sub(1);
         }
-        warm_cv_.notify_all();
+        notify_settled();
         return false;
     }
     return true;

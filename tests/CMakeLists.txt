@@ -5,6 +5,7 @@ set(WARMTH_TEST_SOURCES
     test_concurrency.cpp
     test_property.cpp
     test_cuda.cpp
+    test_regression.cpp
 )
 foreach(src ${WARMTH_TEST_SOURCES})
     get_filename_component(name ${src} NAME_WE)

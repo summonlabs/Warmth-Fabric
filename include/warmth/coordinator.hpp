@@ -102,6 +102,7 @@ private:
     void handle_frame(std::shared_ptr<ConnState> cs, const proto::Frame& frame);
     void on_disconnect(std::shared_ptr<ConnState> cs);
     void invalidate_worker_objects_locked(const WorkerId& worker);
+    void notify_settled();
 
     bool send_frame(net::TcpConnection& conn, std::mutex& send_mutex,
                     proto::MessageType type, std::vector<std::uint8_t> payload);
@@ -117,6 +118,7 @@ private:
     WarmthPolicy policy_;
     std::map<WarmthObjectId, WarmthObject> objects_;
     std::map<WorkerId, std::shared_ptr<ConnState>> workers_;
+    std::vector<std::weak_ptr<ConnState>> conns_;   // every accepted connection, registered or not
     std::map<WorkerId, WorkerBootId> last_boot_;
     std::map<WorkerId, std::set<WarmthObjectId>> worker_objects_;
     BudgetTracker budget_;
